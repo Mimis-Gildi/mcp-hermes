@@ -152,7 +152,8 @@ async function authenticate() {
             access_type: 'offline',
             scope: [
                 'https://www.googleapis.com/auth/gmail.modify',
-                'https://www.googleapis.com/auth/gmail.settings.basic'
+                'https://www.googleapis.com/auth/gmail.settings.basic',
+                'https://www.googleapis.com/auth/contacts'
             ],
         });
 
@@ -317,6 +318,23 @@ const DownloadAttachmentSchema = z.object({
     savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
 });
 
+// ── People API (Google Contacts) schemas ──
+
+const SearchContactsSchema = z.object({
+    query: z.string().describe("Search query string (name, email, phone, etc.)"),
+    pageSize: z.number().optional().default(10).describe("Max results to return (1-30, default 10)"),
+}).describe("Search Google Contacts by name, email, or phone number");
+
+const ListContactsSchema = z.object({
+    pageSize: z.number().optional().default(100).describe("Number of contacts to return per page (1-1000, default 100)"),
+    pageToken: z.string().optional().describe("Token for pagination (from previous response)"),
+    sortOrder: z.enum(['FIRST_NAME_ASCENDING', 'LAST_NAME_ASCENDING']).optional().describe("Sort order for results"),
+}).describe("List all Google Contacts with pagination");
+
+const GetContactSchema = z.object({
+    resourceName: z.string().describe("Contact resource name (e.g., 'people/c1234567890')"),
+}).describe("Get detailed info for a specific contact by resource name");
+
 
 // Main function
 async function main() {
@@ -330,6 +348,12 @@ async function main() {
 
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    // Initialize People API (Google Contacts)
+    const people = google.people({ version: 'v1', auth: oauth2Client });
+
+    // Standard person fields to request from People API
+    const PERSON_FIELDS = 'names,emailAddresses,phoneNumbers,organizations,addresses,birthdays,urls,biographies,metadata';
 
     // Server implementation
     const server = new Server({
@@ -437,6 +461,22 @@ async function main() {
                 name: "download_attachment",
                 description: "Downloads an email attachment to a specified location",
                 inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
+            },
+            // ── People API (Google Contacts) tools ──
+            {
+                name: "search_contacts",
+                description: "Search Google Contacts by name, email, or phone number using the People API",
+                inputSchema: zodToJsonSchema(SearchContactsSchema),
+            },
+            {
+                name: "list_contacts",
+                description: "List all Google Contacts with pagination using the People API",
+                inputSchema: zodToJsonSchema(ListContactsSchema),
+            },
+            {
+                name: "get_contact",
+                description: "Get detailed info for a specific Google Contact by resource name",
+                inputSchema: zodToJsonSchema(GetContactSchema),
             },
         ],
     }))
@@ -1182,6 +1222,130 @@ async function main() {
                             ],
                         };
                     }
+                }
+
+                // ── People API (Google Contacts) handlers ──
+
+                case "search_contacts": {
+                    const validatedArgs = SearchContactsSchema.parse(args);
+                    const response = await people.people.searchContacts({
+                        query: validatedArgs.query,
+                        pageSize: validatedArgs.pageSize,
+                        readMask: PERSON_FIELDS,
+                    });
+
+                    const results = response.data.results || [];
+                    if (results.length === 0) {
+                        return {
+                            content: [{ type: "text", text: `No contacts found for query: "${validatedArgs.query}"` }],
+                        };
+                    }
+
+                    const formatted = results.map((result: any) => {
+                        const p = result.person;
+                        const name = p.names?.[0]?.displayName || '(no name)';
+                        const resourceName = p.resourceName || '';
+                        const emails = (p.emailAddresses || []).map((e: any) => e.value).join(', ');
+                        const phones = (p.phoneNumbers || []).map((ph: any) => `${ph.value}${ph.type ? ' (' + ph.type + ')' : ''}`).join(', ');
+                        const orgs = (p.organizations || []).map((o: any) => `${o.name || ''}${o.title ? ' - ' + o.title : ''}`).join('; ');
+                        const addresses = (p.addresses || []).map((a: any) => a.formattedValue || '').join('; ');
+                        const urls = (p.urls || []).map((u: any) => u.value).join(', ');
+                        const bday = p.birthdays?.[0]?.date ? `${p.birthdays[0].date.month}/${p.birthdays[0].date.day}` : '';
+
+                        let text = `Name: ${name}\nResource: ${resourceName}`;
+                        if (emails) text += `\nEmails: ${emails}`;
+                        if (phones) text += `\nPhones: ${phones}`;
+                        if (orgs) text += `\nOrganization: ${orgs}`;
+                        if (addresses) text += `\nAddress: ${addresses}`;
+                        if (bday) text += `\nBirthday: ${bday}`;
+                        if (urls) text += `\nURLs: ${urls}`;
+                        return text;
+                    }).join('\n\n---\n\n');
+
+                    return {
+                        content: [{ type: "text", text: `Found ${results.length} contacts:\n\n${formatted}` }],
+                    };
+                }
+
+                case "list_contacts": {
+                    const validatedArgs = ListContactsSchema.parse(args);
+                    const response = await people.people.connections.list({
+                        resourceName: 'people/me',
+                        pageSize: validatedArgs.pageSize,
+                        pageToken: validatedArgs.pageToken,
+                        personFields: PERSON_FIELDS,
+                        sortOrder: validatedArgs.sortOrder as any,
+                    });
+
+                    const connections = response.data.connections || [];
+                    const nextPageToken = response.data.nextPageToken || '';
+                    const totalPeople = response.data.totalPeople || 0;
+
+                    if (connections.length === 0) {
+                        return {
+                            content: [{ type: "text", text: "No contacts found." }],
+                        };
+                    }
+
+                    const formatted = connections.map((p: any) => {
+                        const name = p.names?.[0]?.displayName || '(no name)';
+                        const resourceName = p.resourceName || '';
+                        const emails = (p.emailAddresses || []).map((e: any) => e.value).join(', ');
+                        const phones = (p.phoneNumbers || []).map((ph: any) => `${ph.value}${ph.type ? ' (' + ph.type + ')' : ''}`).join(', ');
+                        const org = p.organizations?.[0]?.name || '';
+
+                        let text = `${name} [${resourceName}]`;
+                        if (emails) text += ` | ${emails}`;
+                        if (phones) text += ` | ${phones}`;
+                        if (org) text += ` | ${org}`;
+                        return text;
+                    }).join('\n');
+
+                    let result = `Contacts (${connections.length} of ${totalPeople} total):\n\n${formatted}`;
+                    if (nextPageToken) {
+                        result += `\n\n[Next page token: ${nextPageToken}]`;
+                    }
+
+                    return {
+                        content: [{ type: "text", text: result }],
+                    };
+                }
+
+                case "get_contact": {
+                    const validatedArgs = GetContactSchema.parse(args);
+                    const response = await people.people.get({
+                        resourceName: validatedArgs.resourceName,
+                        personFields: PERSON_FIELDS,
+                    });
+
+                    const p = response.data;
+                    const name = p.names?.[0]?.displayName || '(no name)';
+                    const resourceName = p.resourceName || '';
+                    const emails = (p.emailAddresses || []).map((e: any) => `${e.value}${e.type ? ' (' + e.type + ')' : ''}`).join('\n  ');
+                    const phones = (p.phoneNumbers || []).map((ph: any) => `${ph.value}${ph.type ? ' (' + ph.type + ')' : ''}`).join('\n  ');
+                    const orgs = (p.organizations || []).map((o: any) => {
+                        let s = o.name || '';
+                        if (o.title) s += ` - ${o.title}`;
+                        if (o.department) s += ` (${o.department})`;
+                        return s;
+                    }).join('\n  ');
+                    const addresses = (p.addresses || []).map((a: any) => a.formattedValue || '').join('\n  ');
+                    const bday = p.birthdays?.[0]?.date ? `${p.birthdays[0].date.month}/${p.birthdays[0].date.day}${p.birthdays[0].date.year ? '/' + p.birthdays[0].date.year : ''}` : '';
+                    const urls = (p.urls || []).map((u: any) => u.value).join('\n  ');
+                    const bios = (p.biographies || []).map((b: any) => b.value).join('\n');
+
+                    let text = `Name: ${name}\nResource: ${resourceName}`;
+                    if (emails) text += `\nEmails:\n  ${emails}`;
+                    if (phones) text += `\nPhones:\n  ${phones}`;
+                    if (orgs) text += `\nOrganizations:\n  ${orgs}`;
+                    if (addresses) text += `\nAddresses:\n  ${addresses}`;
+                    if (bday) text += `\nBirthday: ${bday}`;
+                    if (urls) text += `\nURLs:\n  ${urls}`;
+                    if (bios) text += `\nNotes:\n${bios}`;
+
+                    return {
+                        content: [{ type: "text", text }],
+                    };
                 }
 
                 default:
