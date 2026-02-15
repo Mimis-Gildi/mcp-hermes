@@ -335,6 +335,47 @@ const GetContactSchema = z.object({
     resourceName: z.string().describe("Contact resource name (e.g., 'people/c1234567890')"),
 }).describe("Get detailed info for a specific contact by resource name");
 
+const UpdateContactSchema = z.object({
+    resourceName: z.string().describe("Contact resource name (e.g., 'people/c1234567890')"),
+    givenName: z.string().optional().describe("First name"),
+    familyName: z.string().optional().describe("Last name"),
+    organization: z.string().optional().describe("Company/organization name"),
+    title: z.string().optional().describe("Job title"),
+    emails: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., work, home, other"),
+    })).optional().describe("Email addresses (replaces all existing emails)"),
+    phones: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., mobile, work, home"),
+    })).optional().describe("Phone numbers (replaces all existing phones)"),
+    urls: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., profile, blog, homePage"),
+    })).optional().describe("URLs such as LinkedIn profile (replaces all existing URLs)"),
+    notes: z.string().optional().describe("Biographical notes / free-text notes"),
+}).describe("Update an existing Google Contact. Only provided fields are changed; omitted fields are left as-is.");
+
+const CreateContactSchema = z.object({
+    givenName: z.string().describe("First name"),
+    familyName: z.string().optional().describe("Last name"),
+    organization: z.string().optional().describe("Company/organization name"),
+    title: z.string().optional().describe("Job title"),
+    emails: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., work, home, other"),
+    })).optional().describe("Email addresses"),
+    phones: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., mobile, work, home"),
+    })).optional().describe("Phone numbers"),
+    urls: z.array(z.object({
+        value: z.string(),
+        type: z.string().optional().describe("e.g., profile, blog, homePage"),
+    })).optional().describe("URLs such as LinkedIn profile"),
+    notes: z.string().optional().describe("Biographical notes / free-text notes"),
+}).describe("Create a new Google Contact");
+
 
 // Main function
 async function main() {
@@ -477,6 +518,16 @@ async function main() {
                 name: "get_contact",
                 description: "Get detailed info for a specific Google Contact by resource name",
                 inputSchema: zodToJsonSchema(GetContactSchema),
+            },
+            {
+                name: "update_contact",
+                description: "Update an existing Google Contact (name, org, title, emails, phones, URLs, notes)",
+                inputSchema: zodToJsonSchema(UpdateContactSchema),
+            },
+            {
+                name: "create_contact",
+                description: "Create a new Google Contact",
+                inputSchema: zodToJsonSchema(CreateContactSchema),
             },
         ],
     }))
@@ -1345,6 +1396,148 @@ async function main() {
 
                     return {
                         content: [{ type: "text", text }],
+                    };
+                }
+
+                case "update_contact": {
+                    const validatedArgs = UpdateContactSchema.parse(args);
+
+                    // Fetch current contact to get etag and preserve fields we're not changing
+                    const current = await people.people.get({
+                        resourceName: validatedArgs.resourceName,
+                        personFields: PERSON_FIELDS,
+                    });
+
+                    const etag = current.data.etag;
+                    const updatePersonFields: string[] = [];
+                    const requestBody: any = { etag };
+
+                    // Names
+                    if (validatedArgs.givenName !== undefined || validatedArgs.familyName !== undefined) {
+                        requestBody.names = [{
+                            givenName: validatedArgs.givenName ?? current.data.names?.[0]?.givenName,
+                            familyName: validatedArgs.familyName ?? current.data.names?.[0]?.familyName,
+                        }];
+                        updatePersonFields.push('names');
+                    }
+
+                    // Organization + title
+                    if (validatedArgs.organization !== undefined || validatedArgs.title !== undefined) {
+                        const currentOrg = current.data.organizations?.[0] || {};
+                        requestBody.organizations = [{
+                            name: validatedArgs.organization ?? currentOrg.name,
+                            title: validatedArgs.title ?? currentOrg.title,
+                        }];
+                        updatePersonFields.push('organizations');
+                    }
+
+                    // Emails (replaces all)
+                    if (validatedArgs.emails !== undefined) {
+                        requestBody.emailAddresses = validatedArgs.emails.map(e => ({
+                            value: e.value,
+                            type: e.type || 'other',
+                        }));
+                        updatePersonFields.push('emailAddresses');
+                    }
+
+                    // Phones (replaces all)
+                    if (validatedArgs.phones !== undefined) {
+                        requestBody.phoneNumbers = validatedArgs.phones.map(p => ({
+                            value: p.value,
+                            type: p.type || 'other',
+                        }));
+                        updatePersonFields.push('phoneNumbers');
+                    }
+
+                    // URLs (replaces all)
+                    if (validatedArgs.urls !== undefined) {
+                        requestBody.urls = validatedArgs.urls.map(u => ({
+                            value: u.value,
+                            type: u.type || 'other',
+                        }));
+                        updatePersonFields.push('urls');
+                    }
+
+                    // Notes / biographies
+                    if (validatedArgs.notes !== undefined) {
+                        requestBody.biographies = [{
+                            value: validatedArgs.notes,
+                            contentType: 'TEXT_PLAIN',
+                        }];
+                        updatePersonFields.push('biographies');
+                    }
+
+                    if (updatePersonFields.length === 0) {
+                        return {
+                            content: [{ type: "text", text: "No fields to update." }],
+                        };
+                    }
+
+                    const updated = await people.people.updateContact({
+                        resourceName: validatedArgs.resourceName,
+                        updatePersonFields: updatePersonFields.join(','),
+                        requestBody,
+                    });
+
+                    const updatedName = updated.data.names?.[0]?.displayName || '(no name)';
+                    return {
+                        content: [{ type: "text", text: `Updated contact: ${updatedName} (${validatedArgs.resourceName})\nFields updated: ${updatePersonFields.join(', ')}` }],
+                    };
+                }
+
+                case "create_contact": {
+                    const validatedArgs = CreateContactSchema.parse(args);
+
+                    const requestBody: any = {
+                        names: [{
+                            givenName: validatedArgs.givenName,
+                            familyName: validatedArgs.familyName || '',
+                        }],
+                    };
+
+                    if (validatedArgs.organization || validatedArgs.title) {
+                        requestBody.organizations = [{
+                            name: validatedArgs.organization || '',
+                            title: validatedArgs.title || '',
+                        }];
+                    }
+
+                    if (validatedArgs.emails) {
+                        requestBody.emailAddresses = validatedArgs.emails.map(e => ({
+                            value: e.value,
+                            type: e.type || 'other',
+                        }));
+                    }
+
+                    if (validatedArgs.phones) {
+                        requestBody.phoneNumbers = validatedArgs.phones.map(p => ({
+                            value: p.value,
+                            type: p.type || 'other',
+                        }));
+                    }
+
+                    if (validatedArgs.urls) {
+                        requestBody.urls = validatedArgs.urls.map(u => ({
+                            value: u.value,
+                            type: u.type || 'other',
+                        }));
+                    }
+
+                    if (validatedArgs.notes) {
+                        requestBody.biographies = [{
+                            value: validatedArgs.notes,
+                            contentType: 'TEXT_PLAIN',
+                        }];
+                    }
+
+                    const created = await people.people.createContact({
+                        requestBody,
+                    });
+
+                    const createdName = created.data.names?.[0]?.displayName || '(no name)';
+                    const createdResource = created.data.resourceName || '';
+                    return {
+                        content: [{ type: "text", text: `Created contact: ${createdName} (${createdResource})` }],
                     };
                 }
 
