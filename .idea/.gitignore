@@ -1,0 +1,17 @@
+# Always ignored files
+/shelf/
+/workspace.xml
+/queries/
+/dataSources/
+/dataSources.local.xml
+
+# Imported project ignored files
+misc.xml
+modules.xml
+vcs.xml
+
+# Editor-based HTTP Client requests when NOT shared
+/httpRequests/
+
+# rdd13r ignored
+codeStyles/**
